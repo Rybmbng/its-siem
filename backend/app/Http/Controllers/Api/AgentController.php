@@ -9,10 +9,10 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Carbon\Carbon; // PENTING: Wajib ada ini supaya tidak Error 500
 
 class AgentController extends Controller
 {
-    // Properti untuk mempermudah manajemen koneksi
     private $chUrl;
     private $chAuth;
 
@@ -45,6 +45,7 @@ class AgentController extends Controller
                     'os_type'        => 'linux',
                     'status'         => 'active',
                     'last_heartbeat' => now(),
+                    'updated_at'     => now(),
                 ]
             );
 
@@ -56,20 +57,66 @@ class AgentController extends Controller
     }
 
     /**
-     * Ambil Blacklist IP untuk Agent
+     * Data untuk Dashboard Stats & Heartbeat
      */
-    public function blacklist(Request $request)
+    public function getDashboardStats()
     {
-        $agent = Agent::where('api_key', $request->header('X-API-KEY'))->first();
-        
-        if (!$agent) {
-            return response()->json(['message' => 'Invalid API Key'], 403);
+        try {
+            // 1. Ambil Stats dari ClickHouse dengan Timeout Proteksi
+            $query = "SELECT count() as total_logs, countIf(message LIKE '%Failed%' OR message LIKE '%error%') as attacks FROM siem_logs.security_logs FORMAT JSON";
+            
+            $stats = ['total_logs' => 0, 'attacks' => 0];
+            
+            try {
+                $response = Http::withHeaders($this->chAuth)
+                    ->timeout(3)
+                    ->withBody($query, 'text/plain')
+                    ->post($this->chUrl);
+
+                if ($response->successful()) {
+                    $chData = $response->json();
+                    $stats = $chData['data'][0] ?? $stats;
+                }
+            } catch (\Exception $e) {
+                Log::warning("ClickHouse unreachable in stats: " . $e->getMessage());
+            }
+
+            // 2. Ambil Data Agent dari MySQL untuk Heartbeat
+            $agents = DB::table('agents')
+                ->select('hostname', 'last_heartbeat', 'ip_address')
+                ->get()
+                ->map(function($agent) {
+                    // Cek jika last_heartbeat null
+                    if (!$agent->last_heartbeat) {
+                        return [
+                            'hostname'  => $agent->hostname,
+                            'ip'        => $agent->ip_address,
+                            'is_online' => false,
+                            'last_seen' => 'Never',
+                        ];
+                    }
+
+                    $lastSeen = Carbon::parse($agent->last_heartbeat);
+                    $isOnline = $lastSeen->diffInSeconds(now()) < 40; // Toleransi 40 detik
+
+                    return [
+                        'hostname'  => $agent->hostname,
+                        'ip'        => $agent->ip_address,
+                        'is_online' => $isOnline,
+                        'last_seen' => $lastSeen->diffForHumans(),
+                    ];
+                });
+
+            return response()->json([
+                'stats'        => $stats,
+                'agents'       => $agents,
+                'active_count' => $agents->where('is_online', true)->count()
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error("Dashboard Stats Error: " . $e->getMessage());
+            return response()->json(['error' => $e->getMessage()], 500);
         }
-
-        $agent->update(['last_seen_at' => now()]);
-        $ips = IpPolicy::pluck('ip_address'); 
-
-        return response()->json($ips);
     }
 
     /**
@@ -84,23 +131,19 @@ class AgentController extends Controller
             return response()->json(['status' => 'error', 'message' => 'Unauthorized'], 401);
         }
 
-        // Sanitasi pesan agar tidak merusak query SQL ClickHouse
         $message = str_replace("'", "''", $request->message);
         $severity = $request->severity ?? 'info';
 
         $query = "INSERT INTO siem_logs.security_logs 
                   (agent_id, hostname, log_type, message, severity, event_time) 
-                  VALUES (
-                      {$agent->id}, 
-                      '{$agent->hostname}', 
-                      '{$request->log_type}', 
-                      '{$message}', 
-                      '{$severity}', 
-                      now()
-                  )";
+                  VALUES ({$agent->id}, '{$agent->hostname}', '{$request->log_type}', '{$message}', '{$severity}', now())";
 
         try {
             $this->executeClickHouse($query);
+            
+            // Update Heartbeat saat kirim log
+            DB::table('agents')->where('id', $agent->id)->update(['last_heartbeat' => now()]);
+            
             return response()->json(['status' => 'success']);
         } catch (\Exception $e) {
             Log::error("ClickHouse Store Error: " . $e->getMessage());
@@ -109,70 +152,32 @@ class AgentController extends Controller
     }
 
     /**
-     * Data untuk Dashboard Stats
-     */
-    public function getDashboardStats()
-    {
-        // Tambahkan FORMAT JSON agar ClickHouse mengerti
-        $query = "SELECT 
-                    count() as total_logs,
-                    countIf(message LIKE '%Failed%' OR message LIKE '%error%') as attacks,
-                    uniq(hostname) as active_agents
-                  FROM siem_logs.security_logs 
-                  FORMAT JSON"; 
-        
-        return $this->queryClickHouse($query);
-    }
-
-    /**
      * Data untuk Tabel Dashboard
      */
-    public function getLatestLogs()
-    {
-        // Ganti toFormat dengan format standar ClickHouse
-        $query = "SELECT 
-                    formatDateTime(event_time, '%Y-%m-%d %H:%i:%s') as event_time, 
-                    hostname, 
-                    log_type, 
-                    message 
-                  FROM siem_logs.security_logs 
-                  ORDER BY event_time DESC 
-                  LIMIT 50 
-                  FORMAT JSON";
-        
-        return $this->queryClickHouse($query);
-    }
+    public function getLatestLogs(Request $request)
+        {
+            $hostname = $request->query('hostname');
+            $logType = $request->query('log_type');
 
-    /**
-     * Private Helper: Jalankan Query SELECT yang Aman
-     */
-    private function queryClickHouse($query)
-    {
-        try {
-            // Berikan timeout agar tidak membuat browser "hang" menunggu
-            $response = Http::withHeaders($this->chAuth)
-                ->timeout(5) 
-                ->withBody($query, 'text/plain')
-                ->post($this->chUrl);
+            $query = "SELECT formatDateTime(event_time, '%Y-%m-%d %H:%i:%s') as event_time, 
+                    hostname, log_type, message 
+                    FROM siem_logs.security_logs WHERE 1=1";
 
-            if ($response->successful()) {
-                return response()->json($response->json());
+            if ($hostname) {
+                $query .= " AND hostname = '{$hostname}'";
             }
 
-            // Jika ClickHouse error (tabel belum ada dsb)
-            Log::error("ClickHouse Error Response: " . $response->body());
-            return response()->json(['data' => [], 'error' => 'Database error'], 500);
+            // PERBAIKAN: Gunakan LIKE agar 'nginx' bisa menangkap 'nginx-access'
+            if ($logType) {
+                $query .= " AND log_type LIKE '%{$logType}%'";
+            }
 
-        } catch (\Exception $e) {
-            // Jika koneksi ke ClickHouse mati total
-            Log::error("ClickHouse Connection Failed: " . $e->getMessage());
-            return response()->json(['data' => [], 'error' => 'Connection failed'], 500);
+            $query .= " ORDER BY event_time DESC LIMIT 50 FORMAT JSON";
+            
+            $response = Http::withHeaders($this->chAuth)->withBody($query, 'text/plain')->post($this->chUrl);
+            return response()->json($response->json());
         }
-    }
 
-    /**
-     * Private Helper: Jalankan Query INSERT
-     */
     private function executeClickHouse($query)
     {
         $response = Http::withHeaders($this->chAuth)

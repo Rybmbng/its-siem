@@ -1,0 +1,11 @@
+agent_name: prod-server-id-01
+server_url: http://192.168.2.242:8001
+api_url: http://192.168.2.242:8001/api/agent/log
+blacklist_url: ""
+reg_token: MASTER-REG-TOKEN-2025
+api_key: VNX60PByyyrNotH7XwPLAiUtXbMyukWrWx9lSoKJ
+inputs:
+- name: nginx-access
+  path: /var/log/nginx/access.log
+features:
+  sync_interval: 60
